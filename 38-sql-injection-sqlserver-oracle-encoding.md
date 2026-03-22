@@ -112,48 +112,127 @@ single quote ('), double quote ("), backslash (\) and NUL (NULL byte).
 
 `addslashes()` escapes quotes by prepending a backslash: `'` becomes `\'`. This seems safe — the attacker can't close the string. But it fails against **multi-byte character encodings**.
 
+### What Is Character Encoding?
+
+Computers store text as bytes. An **encoding** defines how bytes map to characters.
+
+**Single-byte encodings (ASCII, Latin-1):** every byte is one character.
+
+```
+Byte stream:   48  65  6C  6C  6F
+Characters:     H   e   l   l   o
+               (1 byte = 1 character, always)
+```
+
+**Multi-byte encodings (GBK, Shift-JIS, Big5):** some characters use 2 bytes.
+
+```
+GBK byte stream:   C4  E3  BA  C3
+Characters:          你       好
+                  (2 bytes = 1 character for Chinese chars)
+```
+
+In GBK, if the first byte is in the range `0x81-0xFE`, the next byte is part of the same character. This is where the vulnerability comes from.
+
+### Simple Example: How addslashes() Normally Works
+
+**Normal input (ASCII only):**
+
+```php
+$input = "admin' OR 1=1--";
+$safe  = addslashes($input);
+// Result: "admin\' OR 1=1--"
+```
+
+```sql
+SELECT * FROM users WHERE name = 'admin\' OR 1=1--'
+-- The \' keeps the quote escaped. The string doesn't close. Safe.
+```
+
+The backslash `\` tells MySQL: "the next `'` is literal, not a string terminator." The injection fails.
+
 ### GBK Encoding Bypass (Wide-Byte Injection)
 
-The attacker sends:
+Now the attacker sends a carefully crafted byte sequence:
 
 ```
 0xbf27 or 1=1
 ```
 
+The `0xbf` byte is the key — it's in the GBK leading byte range (`0x81-0xFE`).
+
 **What happens step by step:**
 
-| Step | Data | Explanation |
-|------|------|-------------|
-| Input bytes | `0xbf 0x27` | `0x27` is `'` (single quote) |
-| After addslashes | `0xbf 0x5c 0x27` | `0x5c` (`\`) is inserted before the quote |
-| GBK interpretation | `0xbf5c` = `縗` (valid GBK char) + `0x27` = `'` | The backslash is "eaten" by the multi-byte character |
+```
+Step 1: Attacker's raw input (bytes)
+┌──────┬──────┬──────────────────────┐
+│ 0xBF │ 0x27 │  or 1=1              │
+│  ?   │  '   │                      │
+└──────┴──────┴──────────────────────┘
+         ↑ addslashes sees this quote and inserts 0x5C before it
 
-In GBK encoding (commonly used for Chinese text), `0xbf5c` is a valid two-byte character. The database sees:
-- `縗` — a Chinese character (harmless)
-- `'` — an unescaped single quote (injection!)
+Step 2: After addslashes() processes the bytes
+┌──────┬──────┬──────┬──────────────────────┐
+│ 0xBF │ 0x5C │ 0x27 │  or 1=1              │
+│  ?   │  \   │  '   │                      │
+└──────┴──────┴──────┴──────────────────────┘
+  addslashes thinks: BF is harmless, then \' is an escaped quote. Safe!
+
+Step 3: MySQL receives the bytes and interprets them as GBK
+┌───────────┬──────┬──────────────────────┐
+│ 0xBF 0x5C │ 0x27 │  or 1=1              │
+│    縗      │  '   │                      │
+└───────────┴──────┴──────────────────────┘
+  MySQL GBK parser: BF is a leading byte (0x81-0xFE range),
+  so BF+5C = one Chinese character. The backslash is GONE.
+  0x27 is now a standalone, unescaped single quote!
+```
+
+**The resulting SQL:**
 
 ```sql
 -- What addslashes thinks it produced:
 SELECT * FROM users WHERE name = '縗\' or 1=1'
+--                                  ↑ escaped quote, string continues
 
--- What the GBK-aware database actually sees:
+-- What the GBK-aware MySQL actually sees:
 SELECT * FROM users WHERE name = '縗' or 1=1'
+--                                   ↑ string ends here!
+--                                     ↑ injected condition executes!
 ```
 
-The quote is free, and `or 1=1` executes.
+The quote is free, and `or 1=1` executes. The attacker bypasses authentication or extracts data.
 
-### Why This Works
+### Why This Works — The Core Mismatch
 
 ```
-ASCII:  Each byte = one character
-        0xbf = ¿    0x5c = \    0x27 = '
+addslashes()          MySQL (GBK mode)
+─────────────         ────────────────
+Sees BYTES            Sees CHARACTERS
+1 byte = 1 char       Some byte pairs = 1 char
 
-GBK:    Some byte pairs = one character
-        0xbf5c = 縗              0x27 = '
-        (the backslash is consumed as part of a two-byte character)
+0xBF = one char       0xBF = "I need one more byte"
+0x5C = one char (\)   0x5C = "...this completes the char: 縗"
+0x27 = one char (')   0x27 = standalone quote (')
 ```
 
-`addslashes()` operates on **bytes**, not **characters**. It sees `0x27` and inserts `0x5c` before it. But the GBK-aware MySQL interprets `0xbf5c` as a single character, consuming the backslash.
+`addslashes()` operates on **bytes**, not **characters**. It sees `0x27` and inserts `0x5c` before it. But the GBK-aware MySQL interprets `0xbf5c` as a single two-byte character, consuming the backslash.
+
+**The fundamental problem:** the escaping function and the database use **different rules** to parse the same byte stream. The escaping function thinks the backslash is a separate escape character. The database thinks the backslash is the second half of a Chinese character.
+
+### Which Encodings Are Vulnerable?
+
+Any multi-byte encoding where `0x5C` (backslash) can appear as the **second byte** of a two-byte character:
+
+| Encoding | Vulnerable? | Why |
+|----------|-------------|-----|
+| **GBK** | Yes | `0x5C` is a valid trailing byte |
+| **Big5** | Yes | Same issue — `0x5C` in trailing byte range |
+| **Shift-JIS** | Yes | Japanese encoding with same byte range overlap |
+| **UTF-8** | **No** | Trailing bytes are always `0x80-0xBF` — `0x5C` is never part of a multi-byte sequence |
+| **Latin-1** | **No** | Single-byte encoding — no multi-byte characters |
+
+This is why **UTF-8 is safe** — its design guarantees that ASCII bytes (`0x00-0x7F`) are never "absorbed" into multi-byte sequences.
 
 ### Defenses Against Encoding Bypass
 
