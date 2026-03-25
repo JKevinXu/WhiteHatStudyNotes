@@ -306,6 +306,127 @@ Without IV ($ckey_length = 0):
 
 The 4-byte IV provides `16^4 = 65,536` possible keystreams. Each encryption picks a random one, making keystream reuse unlikely (but not impossible with enough ciphertexts — birthday problem).
 
+## Practical Attack: Forging an Admin Cookie
+
+### Beyond Decryption — Crafting New Ciphertexts
+
+The XOR property also works in reverse. Not only can the attacker **decrypt**, they can also **forge** a valid ciphertext for any plaintext they choose:
+
+```
+E(A) xor E(B) = A xor B            (decrypt — recover unknown plaintext)
+A xor E(A) xor B = E(B)            (forge — create ciphertext for chosen plaintext)
+```
+
+The second equation means: if you know plaintext A and its ciphertext E(A), you can compute the ciphertext for **any** plaintext B without knowing the key.
+
+### Attack Scenario: Cookie Forgery
+
+Suppose Discuz stores user identity in an encrypted cookie:
+
+```
+Cookie value = authcode(username + role, "ENCODE", UC_KEY)
+```
+
+The attacker has their own account and knows:
+- Their username + role: `accountA+member`
+- Their encrypted cookie: `Cookie(A)`
+
+They want to forge a cookie for the admin:
+- Target plaintext: `admin_account+manager`
+
+```
+(accountA+member) xor Cookie(A) xor (admin_account+manager) = Cookie(admin)
+```
+
+**Step by step:**
+
+```
+The attacker computes:
+  Known plaintext:     "accountA+member"           = A
+  Known ciphertext:    Cookie(A)                    = E(A) = A xor Keystream
+  Target plaintext:    "admin_account+manager"      = B
+
+  A xor E(A) = Keystream                            (recover the keystream)
+  Keystream xor B = E(B)                            (encrypt target with same keystream)
+
+  Or in one step:
+  A xor E(A) xor B = E(B) = Cookie(admin)
+
+The attacker replaces their cookie with Cookie(admin)
+→ Server decrypts it → gets "admin_account+manager"
+→ Attacker is now admin!
+```
+
+### But Wait — The Integrity Check
+
+The authcode decryption function has an integrity verification step:
+
+```php
+if ($operation == 'DECODE') {
+    // Verify the data hasn't been tampered with
+    if (
+        // Check 1: Is it expired?
+        // substr($result, 0, 10) = the 10-digit expiry timestamp
+        // If it's 0 (no expiry) OR the timestamp is still in the future → pass
+        (substr($result, 0, 10) == 0 || substr($result, 0, 10) - time() > 0)
+
+        &&
+
+        // Check 2: Does the integrity hash match?
+        // substr($result, 10, 16) = the stored 16-char hash (set during encryption)
+        // md5(substr($result, 26) . $keyb) = recalculated hash of (plaintext + keyb)
+        // If they match → data wasn't tampered with
+        substr($result, 10, 16) == substr(md5(substr($result, 26) . $keyb), 0, 16)
+    ) {
+        return substr($result, 26);  // return the plaintext (skip 26-byte header)
+    } else {
+        return '';  // tampered or expired → reject
+    }
+}
+```
+
+### Does the Integrity Hash Stop the Forgery?
+
+The integrity hash is:
+
+```php
+md5(substr($result, 26) . $keyb)
+// = MD5(actual_plaintext + keyb)
+```
+
+**The attacker doesn't know `$keyb`**, so they can't compute the correct hash for `"admin_account+manager"`.
+
+When the attacker forges the ciphertext using XOR, they can control bytes 26+ (the plaintext), but bytes 10-25 (the integrity hash) will **also** be XOR-forged — and the result will be a garbage hash that doesn't match `MD5(new_plaintext + keyb)`.
+
+```
+Forged ciphertext decrypts to:
+┌──────────────┬──────────────────┬─────────────────────────┐
+│ expiry (ok)   │ hash (GARBAGE!)  │ admin_account+manager   │
+│ 0000000000    │ 7f3a...wrong     │ (attacker's target)     │
+├──────────────┼──────────────────┼─────────────────────────┤
+│ position 0-9  │ position 10-25   │ position 26+            │
+└──────────────┴──────────────────┴─────────────────────────┘
+
+Server recalculates: MD5("admin_account+manager" + keyb) = "a9c1...correct"
+Stored hash:         "7f3a...wrong"
+→ MISMATCH → rejected!
+```
+
+**So the integrity hash (`$keyb`) prevents naive XOR forgery.** The attacker can craft the plaintext portion, but the hash verification catches the tampering.
+
+### When the Attack Still Works
+
+The integrity check **does** protect against forgery in authcode — but only if:
+
+1. **`$keyb` is secret** — if it leaks (via another vulnerability, config exposure, etc.), the attacker can compute valid hashes
+2. **The hash comparison is secure** — the `==` comparison in PHP has type juggling issues; in some edge cases `"0e123..." == "0e456..."` evaluates to true (both parsed as scientific notation = 0)
+3. **The entire system uses authcode** — if some other part of the system uses the same key with plain XOR (no integrity hash), that part is fully vulnerable
+
+The XOR reuse attack is most dangerous when:
+- The IV is disabled (`$ckey_length = 0`)
+- The encryption has **no integrity check** (pure XOR/RC4 without a MAC)
+- The attacker has a known-plaintext/ciphertext pair
+
 ## Key Takeaways
 
 | Principle | Explanation |
