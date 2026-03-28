@@ -354,8 +354,13 @@ The 4-byte IV provides `16^4 = 65,536` possible keystreams. Each encryption pick
 The XOR property also works in reverse. Not only can the attacker **decrypt**, they can also **forge** a valid ciphertext for any plaintext they choose:
 
 ```
-E(A) xor E(B) = A xor B            (decrypt — recover unknown plaintext)
-A xor E(A) xor B = E(B)            (forge — create ciphertext for chosen plaintext)
+Decryption attack:
+  E(A) xor E(B) = A xor B
+  → If you know A, you can recover B
+
+Forgery attack:
+  A xor E(A) xor B = E(B)
+  → If you know A and E(A), you can create E(B) for any chosen B
 ```
 
 The second equation means: if you know plaintext A and its ciphertext E(A), you can compute the ciphertext for **any** plaintext B without knowing the key.
@@ -365,18 +370,19 @@ The second equation means: if you know plaintext A and its ciphertext E(A), you 
 Suppose Discuz stores user identity in an encrypted cookie:
 
 ```
-Cookie value = authcode(username + role, "ENCODE", UC_KEY)
+Cookie value = authcode(username+role, "ENCODE", UC_KEY)
 ```
 
 The attacker has their own account and knows:
-- Their username + role: `accountA+member`
-- Their encrypted cookie: `Cookie(A)`
+- Their plaintext: `accountA+member`
+- Their cookie: `Cookie(A)`
 
-They want to forge a cookie for the admin:
-- Target plaintext: `admin_account+manager`
+Target:
+- Admin plaintext: `admin_account+manager`
 
+Forgery formula:
 ```
-(accountA+member) xor Cookie(A) xor (admin_account+manager) = Cookie(admin)
+Cookie(admin) = (accountA+member) xor Cookie(A) xor (admin_account+manager)
 ```
 
 **Step by step:**
@@ -404,24 +410,22 @@ The authcode decryption function has an integrity verification step:
 
 ```php
 if ($operation == 'DECODE') {
-    // Verify the data hasn't been tampered with
+    // Two-step verification:
     if (
-        // Check 1: Is it expired?
-        // substr($result, 0, 10) = the 10-digit expiry timestamp
-        // If it's 0 (no expiry) OR the timestamp is still in the future → pass
+        // 1. Check expiry: substr($result, 0, 10) = timestamp
+        //    Pass if: 0 (no expiry) OR timestamp > current time
         (substr($result, 0, 10) == 0 || substr($result, 0, 10) - time() > 0)
 
         &&
 
-        // Check 2: Does the integrity hash match?
-        // substr($result, 10, 16) = the stored 16-char hash (set during encryption)
-        // md5(substr($result, 26) . $keyb) = recalculated hash of (plaintext + keyb)
-        // If they match → data wasn't tampered with
+        // 2. Check integrity: substr($result, 10, 16) = stored hash
+        //    Recalculate: md5(plaintext + keyb)
+        //    Pass if: stored hash == recalculated hash
         substr($result, 10, 16) == substr(md5(substr($result, 26) . $keyb), 0, 16)
     ) {
-        return substr($result, 26);  // return the plaintext (skip 26-byte header)
+        return substr($result, 26);  // valid → return plaintext
     } else {
-        return '';  // tampered or expired → reject
+        return '';  // tampered/expired → reject
     }
 }
 ```
@@ -431,11 +435,10 @@ if ($operation == 'DECODE') {
 The integrity hash is:
 
 ```php
-md5(substr($result, 26) . $keyb)
-// = MD5(actual_plaintext + keyb)
+md5(plaintext . $keyb)
 ```
 
-**The attacker doesn't know `$keyb`**, so they can't compute the correct hash for `"admin_account+manager"`.
+**The attacker doesn't know `$keyb`**, so they can't compute the correct hash for forged plaintext.
 
 When the attacker forges the ciphertext using XOR, they can control bytes 26+ (the plaintext), but bytes 10-25 (the integrity hash) will **also** be XOR-forged — and the result will be a garbage hash that doesn't match `MD5(new_plaintext + keyb)`.
 
